@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""
-async_ssl_proxy.py
+r"""
+ssl_proxy.py
 
 Async dual-auth SSL reverse proxy:
  - Prefer client TLS certificate (smart card)
  - Optional Windows Native Auth (SPNEGO) fallback
  - Forwards requests to backend (HTTP) and injects identity headers:
      X-Auth-User, X-Auth-Method, X-Client-DN
- - Removes single-letter domain prefix (e.g. "U\\") from usernames by default
+ - Removes single-letter domain prefix (e.g. "U\ ") from usernames by default
  - Streams backend responses (preserves keep-alive, avoids server disconnects)
  - Creates ClientSession inside event loop to avoid timeout-context errors
 """
@@ -56,7 +56,7 @@ CERT_DN_HEADER = "X-Client-DN"
 FORWARDED_FOR_HEADER = "X-Forwarded-For"
 FORWARDED_PROTO_HEADER = "X-Forwarded-Proto"
 
-TRUSTED_PROXIES = ["127.0.0.1", "::1"]  # optionally enforce if front proxy sets headers
+TRUSTED_PROXIES = ["127.0.0.1", "::1"]
 
 BACKEND_TIMEOUT_SECONDS = 60
 
@@ -64,13 +64,13 @@ LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
-logger = logging.getLogger("async_ssl_proxy")
+logger = logging.getLogger("ssl_proxy")
 
 # ===========================
 # Certificate parsing helpers
 # ===========================
 def extract_cert_identity_from_der(cert_der: bytes) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
+    r"""
     Extract username (CN), domain (derived from O/organization), and printable DN from DER-encoded cert.
     Treat single-letter domains as absent (to avoid U\ prefix artifacts).
     """
@@ -111,8 +111,8 @@ def extract_cert_identity_from_der(cert_der: bytes) -> Tuple[Optional[str], Opti
 # WNA identity parser
 # ===========================
 def parse_wna_identity(identity: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parse identity strings: DOMAIN\\user, user@REALM, or user.
+    r"""
+    Parse identity strings: DOMAIN\user, user@REALM, or user.
     Single-letter domains are treated as absent to avoid U\ artifacts.
     """
     if not identity:
@@ -207,7 +207,7 @@ class DualAuthProxy:
             logger.info("Backend ClientSession closed")
 
     async def _get_peer_cert_der(self, request: web.Request) -> Optional[bytes]:
-        """
+        r"""
         Try to obtain peer cert DER bytes from transport's ssl_object.
         When TLS termination happens upstream, the frontend must forward cert data via headers.
         """
@@ -281,7 +281,6 @@ class DualAuthProxy:
         for k, v in headers.items():
             if k.lower() in hop_by_hop:
                 continue
-            # optionally: validate trusted proxies before accepting X-Forwarded-For from earlier hops
             forward_headers[k] = v
 
         # Inject identity headers
@@ -309,23 +308,20 @@ class DualAuthProxy:
 
         target_url = f"{BACKEND_BASE}{path_qs}"
         try:
-            # Use streaming response to preserve backend streaming and keepalive
             async with self._client.request(method, target_url, headers=forward_headers, data=body) as resp:
-                # Build StreamResponse to stream back to client
+                # StreamResponse to stream backend response to client reliably
                 response = web.StreamResponse(status=resp.status, reason=resp.reason)
-                # copy headers (excluding hop-by-hop)
                 for k, v in resp.headers.items():
                     lk = k.lower()
                     if lk in ("transfer-encoding", "connection"):
                         continue
                     response.headers[k] = v
 
-                # Important: avoid aiohttp injecting default content_type
+                # Prevent aiohttp from inserting a default content-type
                 response.content_type = None
 
                 await response.prepare(request)
 
-                # Stream chunks from backend to client
                 async for chunk in resp.content.iter_chunked(8192):
                     if chunk:
                         await response.write(chunk)
@@ -369,11 +365,12 @@ async def init_app() -> web.Application:
 
 def create_ssl_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
     # Use modern minimum TLS; do not use deprecated OP_NO_TLS flags
     try:
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     except Exception:
-        # older Python may not support TLSVersion enum; ignore
+        # older Pythons may not support TLSVersion enum; ignore
         pass
 
     # load server cert
@@ -394,7 +391,8 @@ def create_ssl_context() -> ssl.SSLContext:
 # Entrypoint
 # ===========================
 def main():
-    app = asyncio.get_event_loop().run_until_complete(init_app())
+    # Use asyncio.run to create and run app in a fresh event loop (warning-free)
+    app = asyncio.run(init_app())
     ssl_ctx = create_ssl_context()
     logger.info("Starting async SSL proxy on https://%s:%s -> %s", PROXY_HOST, PROXY_PORT, BACKEND_BASE)
     web.run_app(app, host=PROXY_HOST, port=PROXY_PORT, ssl_context=ssl_ctx)
