@@ -356,21 +356,23 @@
 
         async function loadUserInfo() {
             try {
-                const res = await fetch(`${API_BASE}/auth/me`, { credentials: 'include' });
+                const res = await fetch('/whoami', { credentials: 'include' });
                 if (res.ok) {
-                    const user = await res.json();
-                    currentUser = user;
-                    const displayName = user.display_name || user.username || user.name || 'Unknown User';
-                    document.getElementById('userName').textContent = displayName;
-                    const method = user.auth_method || user.method || 'authenticated';
-                    const methodLabels = { 'smartcard': '🔐 Smart Card', 'wna': '🪟 Windows Auth', 'certificate': '🔐 Certificate', 'kerberos': '🎫 Kerberos', 'ntlm': '🪟 NTLM' };
-                    document.getElementById('authMethod').textContent = methodLabels[method] || method;
-                    document.getElementById('wfRequestor').value = user.username || displayName;
-                    addLog(`Authenticated as ${displayName} via ${method}`, 'success');
+                    const data = await res.json();
+                    if (data.logged_in && data.user) {
+                        currentUser = data.user;
+                        const displayName = data.user.full_name || data.user.username || 'Unknown User';
+                        document.getElementById('userName').textContent = displayName;
+                        const method = data.user.auth_method || 'smartcard';
+                        const methodLabels = { 'smartcard': '🔐 Smart Card', 'cert': '🔐 Smart Card', 'wna': '🪟 Windows Auth', 'password': '🔑 Password' };
+                        document.getElementById('authMethod').textContent = methodLabels[method] || method;
+                        document.getElementById('wfRequestor').value = data.user.username || displayName;
+                        addLog(`Authenticated as ${displayName}`, 'success');
+                    } else {
+                        window.location.href = '/login.html';
+                    }
                 } else {
-                    document.getElementById('userName').textContent = 'Not Authenticated';
-                    document.getElementById('authMethod').textContent = 'Auth Required';
-                    addLog('Authentication required', 'error');
+                    window.location.href = '/login.html';
                 }
             } catch (err) {
                 document.getElementById('userName').textContent = 'Auth Error';
