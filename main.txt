@@ -1,0 +1,328 @@
+# main.py - Orchestration System with Client Certificate Authentication
+
+import os
+import logging
+import secrets
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from dotenv import load_dotenv
+from starlette.middleware.sessions import SessionMiddleware
+
+from controller.routes import agents, workflows, tokens, scripts
+from controller.routes.auth import auth_router
+from controller.routes.executions import router as executions_router
+from controller.routes.logs import router as logs_router
+from controller.auth.web_auth import (
+    get_current_user_from_session,
+    SessionManager,
+    UserAuth,
+    SESSION_COOKIE_NAME,
+)
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Orchestration System API",
+    description="Backend API for workflow orchestration with smartcard authentication",
+    version="2.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(SessionMiddleware, secret_key="CHANGE_THIS_SECRET_KEY")
+
+# OU-based and CN-based role mapping
+OU_ROLE_MAP = {
+    "IT SECURITY": "admin",
+    "DEVOPS": "ops",
+    "OPERATIONS": "ops",
+    "FINANCE": "viewer",
+    "HR": "viewer",
+    "DBA": "admin",
+}
+
+ROLE_MAP = {
+    "John Smith": "admin",
+    "Jane Doe": "ops",
+    "AutomationBot": "system",
+}
+
+DEFAULT_ROLE = "viewer"
+
+
+def extract_ou_from_dn(dn: str) -> str | None:
+    if not dn:
+        return None
+    parts = [p.strip() for p in dn.split(",")]
+    for p in parts:
+        if p.startswith("OU="):
+            return p[3:]
+    return None
+
+
+@app.middleware("http")
+async def cert_auto_login(request: Request, call_next):
+    """Auto-login using certificate CN/OU into DB-backed sessions."""
+    from controller.db.db import get_db
+    db = get_db()
+
+    # 1) Existing valid session?
+    session_cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if session_cookie:
+        sm = SessionManager(db)
+        if sm.get_session(session_cookie):
+            return await call_next(request)
+
+    # 2) Certificate headers forwarded by proxy?
+    cert_cn = request.headers.get("x-client-cert-cn")
+    cert_dn = request.headers.get("x-client-cert-dn")
+
+    if not cert_cn:
+        return await call_next(request)
+
+    logger.info(f"[CERT] Client certificate detected: CN={cert_cn} DN={cert_dn}")
+
+    cursor = db.conn.cursor()
+    cursor.execute(
+        '''
+        SELECT user_id, username, role, full_name, email
+        FROM users
+        WHERE username = ? AND is_active = 1
+        ''',
+        (cert_cn,)
+    )
+    row = cursor.fetchone()
+
+    if row:
+        user = dict(row)
+        user_id = user["user_id"]
+        role = user["role"]
+        logger.info(f"[CERT LOGIN] Existing user matched: {cert_cn} → role={role}")
+    else:
+        # derive role from OU or CN or default
+        ou = extract_ou_from_dn(cert_dn)
+        if ou and ou.upper() in OU_ROLE_MAP:
+            role = OU_ROLE_MAP[ou.upper()]
+            logger.info(f"[CERT ROLE] OU matched: OU={ou} → role={role}")
+        elif cert_cn in ROLE_MAP:
+            role = ROLE_MAP[cert_cn]
+            logger.info(f"[CERT ROLE] CN matched: CN={cert_cn} → role={role}")
+        else:
+            role = DEFAULT_ROLE
+            logger.info(f"[CERT ROLE] No OU/CN match → default role={role}")
+
+        user_auth = UserAuth(db)
+        random_password = secrets.token_urlsafe(16)
+        new_user = user_auth.create_user(
+            username=cert_cn,
+            password=random_password,
+            role=role,
+            full_name=cert_cn,
+            email=None,
+            auth_method="cert"
+        )
+        user_id = new_user["user_id"]
+        logger.info(f"[CERT LOGIN] Created new cert user: {cert_cn} → role={role}")
+
+    # Create DB-backed session + cookie
+    sm = SessionManager(db)
+    ip_address = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
+
+    response = RedirectResponse(url="/dashboard", status_code=302)
+    sm.create_session(
+        user_id=user_id,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        response=response
+    )
+
+    logger.info(f"[CERT LOGIN] Session established for CN={cert_cn} → user_id={user_id}")
+    return response
+
+
+@app.get("/api/debug")
+def debug_headers(request: Request):
+    dn = request.headers.get("x-client-cert-dn")
+    cn = request.headers.get("x-client-cert-cn")
+    ou = extract_ou_from_dn(dn)
+
+    return {
+        "cert_headers": {
+            "dn": dn,
+            "cn": cn,
+            "ou_extracted": ou,
+        },
+        "cookie": request.cookies.get(SESSION_COOKIE_NAME),
+        "db_user": get_current_user_from_session(
+            request,
+            request.cookies.get(SESSION_COOKIE_NAME)
+        ),
+    }
+
+
+@app.get("/whoami")
+def whoami(request: Request):
+    user = get_current_user_from_session(
+        request, request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    return {
+        "user": user,
+        "logged_in": user is not None,
+    }
+
+
+app.include_router(auth_router, prefix="/api")
+app.include_router(agents.router, prefix="/api")
+app.include_router(workflows.router, prefix="/api")
+app.include_router(tokens.router, prefix="/api")
+app.include_router(scripts.router, prefix="/api")
+app.include_router(executions_router, prefix="/api")
+app.include_router(logs_router, prefix="/api")
+
+
+@app.get("/")
+async def root(request: Request):
+    user = get_current_user_from_session(
+        request, request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    if user:
+        return RedirectResponse(url="/dashboard")
+    else:
+        return RedirectResponse(url="/login.html")
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "authentication": "client_certificate",
+        "server": "hypercorn"
+    }
+
+
+@app.get("/assets/{path:path}")
+async def serve_assets(path: str, request: Request):
+    user = get_current_user_from_session(
+        request, request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    file_path = f"dashboard/dist/assets/{path}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    mime_type = "application/octet-stream"
+    if path.endswith(".js"):
+        mime_type = "application/javascript"
+    elif path.endswith(".css"):
+        mime_type = "text/css"
+    elif path.endswith(".png"):
+        mime_type = "image/png"
+    elif path.endswith(".jpg") or path.endswith(".jpeg"):
+        mime_type = "image/jpeg"
+    elif path.endswith(".svg"):
+        mime_type = "image/svg+xml"
+    elif path.endswith(".woff") or path.endswith(".woff2"):
+        mime_type = "font/woff2"
+    elif path.endswith(".json"):
+        mime_type = "application/json"
+
+    return FileResponse(file_path, media_type=mime_type)
+
+
+@app.get("/login.html", response_class=HTMLResponse)
+async def login_page():
+    possible_paths = [
+        "dashboard/dist/login.html",
+        "public/login.html"
+    ]
+
+    current_dir = os.getcwd()
+    logger.info(f"Looking for login.html. Current directory: {current_dir}")
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    content = f.read()
+                    logger.info(f"Loaded login.html from {path}")
+                    return HTMLResponse(content=content)
+            except Exception as e:
+                logger.error(f"Error reading {path}: {e}")
+                continue
+
+    error_msg = f"""<h1>Login page not found</h1>
+<p><strong>Current working directory:</strong> {current_dir}</p>"""
+    return HTMLResponse(content=error_msg, status_code=404)
+
+
+@app.get("/dashboard/{path:path}")
+async def serve_dashboard(path: str, request: Request):
+    user = get_current_user_from_session(
+        request, request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    if not user:
+        return RedirectResponse(url="/login.html")
+
+    if path == "" or path == "/":
+        path = "index.html"
+
+    file_path = f"dashboard/dist/{path}"
+    if os.path.exists(file_path):
+        mime_type = "text/html"
+        if path.endswith(".js"):
+            mime_type = "application/javascript"
+        elif path.endswith(".css"):
+            mime_type = "text/css"
+        elif path.endswith(".json"):
+            mime_type = "application/json"
+        elif path.endswith(".png"):
+            mime_type = "image/png"
+        elif path.endswith(".jpg") or path.endswith(".jpeg"):
+            mime_type = "image/jpeg"
+        elif path.endswith(".svg"):
+            mime_type = "image/svg+xml"
+        elif path.endswith(".woff") or path.endswith(".woff2"):
+            mime_type = "font/woff2"
+        return FileResponse(file_path, media_type=mime_type)
+    else:
+        return FileResponse("dashboard/dist/index.html", media_type="text/html")
+
+
+@app.get("/dashboard")
+async def dashboard_root(request: Request):
+    user = get_current_user_from_session(
+        request, request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    if not user:
+        return RedirectResponse(url="/login.html")
+    return FileResponse("dashboard/dist/index.html", media_type="text/html")
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("=" * 60)
+    logger.info("Orchestration System API Starting")
+    logger.info("Authentication: Client Certificate (Smartcard)")
+    logger.info("Server: Hypercorn with TLS")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    print("Do not run main.py directly; use hypercorn -c hypercorn.toml main:app")
+
