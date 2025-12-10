@@ -46,10 +46,10 @@ CLIENT_CERT_REQUIRED = ssl.CERT_OPTIONAL
 ENABLE_WNA_FALLBACK = True     # Enable WNA when no client cert
 WNA_SERVICE_NAME = "HTTP"      # Kerberos service name
 
-# Headers to pass identity to backend
-AUTH_USER_HEADER = "X-Auth-User"
-AUTH_METHOD_HEADER = "X-Auth-Method"
-CERT_DN_HEADER = "X-Client-DN"
+# Headers to pass identity to backend (matching existing main.py)
+CERT_CN_HEADER = "X-Client-Cert-CN"      # Certificate Common Name
+CERT_DN_HEADER = "X-Client-Cert-DN"      # Certificate Distinguished Name
+AUTH_METHOD_HEADER = "X-Auth-Method"     # Auth method used
 
 # Default domain for Smart Card auth (set to your org's domain)
 DEFAULT_DOMAIN = "YOURORG"  # <-- CHANGE THIS to your domain (e.g., "CORP", "AGENCY")
@@ -261,6 +261,7 @@ class DualAuthProxyHandler(http.server.BaseHTTPRequestHandler):
                     user, domain = parse_wna_identity(username)
                     self._auth_user = f"{domain}\\{user}" if domain else user
                     self._auth_method = "wna"
+                    self._cert_dn = f"CN={user}"  # Minimal DN for WNA
                     logger.info(f"[{self.client_address[0]}] WNA auth: {self._auth_user}")
                     return True
                 elif challenge:
@@ -320,9 +321,14 @@ class DualAuthProxyHandler(http.server.BaseHTTPRequestHandler):
                                         'transfer-encoding', 'upgrade', 'authorization'):
                     headers[key] = value
             
-            # Add authentication headers
+            # Add authentication headers (matching main.py expectations)
             if self._auth_user:
-                headers[AUTH_USER_HEADER] = self._auth_user
+                # Extract just the username (CN) without domain for x-client-cert-cn
+                if '\\' in self._auth_user:
+                    cn_only = self._auth_user.split('\\', 1)[1]
+                else:
+                    cn_only = self._auth_user
+                headers[CERT_CN_HEADER] = cn_only
             if self._auth_method:
                 headers[AUTH_METHOD_HEADER] = self._auth_method
             if self._cert_dn:
