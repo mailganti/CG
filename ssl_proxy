@@ -1,3 +1,51 @@
+import http.server
+import http.client
+import ssl
+import socket
+import logging
+from urllib.parse import urlparse
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+import base64
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Proxy server configuration
+PROXY_HOST = '10.28.203.100'  # Listen on this IP
+PROXY_PORT = 7605              # Listen on this port
+
+# Backend server configuration
+BACKEND_HOST = '127.0.0.1'     # Uvicorn backend
+BACKEND_PORT = 8000            # Uvicorn port
+
+# SSL/TLS configuration
+SERVER_CERT_FILE = 'controller/certs/cert.pem'       # Server certificate
+SERVER_KEY_FILE = 'controller/certs/key.pem'         # Server private key
+CA_CERT_FILE = 'controller/certs/certChain.pem'      # CA for client certs
+
+# Client certificate verification
+# ssl.CERT_NONE: No client certificate required
+# ssl.CERT_OPTIONAL: Client can provide certificate
+# ssl.CERT_REQUIRED: Client must provide certificate
+CLIENT_CERT_REQUIRED = ssl.CERT_OPTIONAL
+
+# Logging
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# ============================================================
+# LOGGING SETUP
+# ============================================================
+
+logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
+logger = logging.getLogger('ssl_proxy')
+
+
+---
+
+
 """
 Dual Authentication SSL Proxy
 =============================
