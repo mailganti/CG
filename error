@@ -1,3 +1,32 @@
-2025-12-10 11:45:07,311 - ssl_proxy - INFO - [170.20.254.138] Smart Card auth: U\Jon Albano (affiliate)
-2025-12-10 11:45:07,312 - ssl_proxy - ERROR - Proxy error: Remote end closed connection without response
-2025-12-10 11:45:07,312 - ssl_proxy - INFO - 170.20.254.138 - code 502, message Bad Gateway: Remote end closed connection without response
+2025-12-10 12:02:18,484 - async_ssl_proxy - INFO - [172.20.254.38] Smart Card auth: U\Rajesh Mudiganti (affiliate)
+2025-12-10 12:02:18,484 - async_ssl_proxy - ERROR - Unexpected proxy error: Timeout context manager should be used inside a task
+Traceback (most recent call last):
+  File "/ADMIN/Oracle/Toolkits/Clone/tools/python/ssaAgent/orchestration-system/proxy/ssl_proxy.py", line 349, in handle_request
+    async with self._client.request(method, target_url, headers=forward_headers, data=body) as resp:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/client.py", line 1510, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/client.py", line 624, in _request
+    with timer:
+         ^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/helpers.py", line 678, in __enter__
+    raise RuntimeError("Timeout context manager should be used inside a task")
+RuntimeError: Timeout context manager should be used inside a task
+2025-12-10 12:02:18,490 - aiohttp.access - INFO - 172.20.254.38 [10/Dec/2025:12:02:18 -0500] "GET / HTTP/1.1" 502 245 "-" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0"
+2025-12-10 12:02:18,632 - async_ssl_proxy - INFO - [172.20.254.38] Smart Card auth: U\Rajesh Mudiganti (affiliate)
+2025-12-10 12:02:18,632 - async_ssl_proxy - ERROR - Unexpected proxy error: Timeout context manager should be used inside a task
+Traceback (most recent call last):
+  File "/ADMIN/Oracle/Toolkits/Clone/tools/python/ssaAgent/orchestration-system/proxy/ssl_proxy.py", line 349, in handle_request
+    async with self._client.request(method, target_url, headers=forward_headers, data=body) as resp:
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/client.py", line 1510, in __aenter__
+    self._resp: _RetType = await self._coro
+                           ^^^^^^^^^^^^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/client.py", line 624, in _request
+    with timer:
+         ^^^^^
+  File "/ADMIN/Oracle/Toolkits/deployStage/tools/python/newPython/lib/python3.12/site-packages/aiohttp/helpers.py", line 678, in __enter__
+    raise RuntimeError("Timeout context manager should be used inside a task")
+RuntimeError: Timeout context manager should be used inside a task
+2025-12-10 12:02:18,633 - aiohttp.access - INFO - 172.20.254.38 [10/Dec/2025:12:02:18 -0500] "GET /favicon.ico HTTP/1.1" 502 245 "https://ds-d1-ebs-01.ba.ssa.gov:7585/" "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0"
