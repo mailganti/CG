@@ -7,3 +7,11 @@ Smart Card auth: Rajesh Mudiganti (affiliate)
 from fastapi.staticfiles import StaticFiles
 
 app.mount("/", StaticFiles(directory="dashboard/dist", html=True), name="static")
+
+
+
+from fastapi.responses import FileResponse
+
+@app.get("/")
+async def root():
+    return FileResponse("dashboard/dist/index.html")
