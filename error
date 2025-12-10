@@ -1,8 +1,3 @@
-======= Running on https://ds-d1-ebs-01.ba.ssa.gov:7585 ========
-(Press CTRL+C to quit)
-/ADMIN/Oracle/Toolkits/Clone/tools/python/ssaAgent/orchestration-system/proxy/ssl_proxy.py:71: SyntaxWarning: invalid escape sequence '\ '
-  """
-/ADMIN/Oracle/Toolkits/Clone/tools/python/ssaAgent/orchestration-system/proxy/ssl_proxy.py:112: SyntaxWarning: invalid escape sequence '\ '
-  """
-/ADMIN/Oracle/Toolkits/Clone/tools/python/ssaAgent/orchestration-system/proxy/ssl_proxy.py:395: DeprecationWarning: There is no current event loop
-  app = asyncio.get_event_loop().run_until_complete(init_app())
+Smart Card auth: Rajesh Mudiganti (affiliate)
+ ERROR - Proxy error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
+ code 502, message Bad Gateway: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
