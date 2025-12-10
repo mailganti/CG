@@ -1,3 +1,6 @@
+
+ssl_proxy.py:387: DeprecationWarning: ssl.OP_NO_SSL*/ssl.OP_NO_TLS* options are deprecated
+
 2025-12-10 12:02:18,484 - async_ssl_proxy - INFO - [172.20.254.38] Smart Card auth: U\Rajesh Mudiganti (affiliate)
 2025-12-10 12:02:18,484 - async_ssl_proxy - ERROR - Unexpected proxy error: Timeout context manager should be used inside a task
 Traceback (most recent call last):
