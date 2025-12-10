@@ -15,7 +15,7 @@ import base64
 import logging
 import socket
 import ssl
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 from aiohttp import web, ClientTimeout, ClientSession, ClientConnectionError, TCPConnector
 from cryptography import x509
@@ -103,12 +103,15 @@ def extract_cert_identity_from_der(cert_der: bytes) -> Tuple[Optional[str], Opti
         dn_parts = []
         for rdn in subject.rdns:
             for attr in rdn:
-                # Use attribute name if available, else OID
                 name = getattr(attr.oid, "_name", None) or attr.oid.dotted_string
                 dn_parts.append(f"{name}={attr.value}")
         cert_dn = ", ".join(dn_parts) if dn_parts else None
 
         username = cn or None
+        # Normalize single-letter domain (e.g. "U") -> treat as absent
+        if domain and len(domain) == 1:
+            domain = None
+
         return username, domain, cert_dn
     except Exception as e:
         logger.exception("Failed to parse client certificate: %s", e)
@@ -124,24 +127,27 @@ def parse_wna_identity(identity: str) -> Tuple[Optional[str], Optional[str]]:
       - user@domain.com
       - user
     Returns (username, domain) where domain may be None.
-    Also strips common leading domain shortnames like 'U\\' if present.
+    Also strips single-letter domain shortnames like 'U' (treated as absent).
     """
     if not identity:
         return None, None
 
     # Some libraries return principal like "DOMAIN\\user" or "user@REALM"
-    # Ensure we handle domain prefix stripping robustly.
     if "\\" in identity:
         parts = identity.split("\\", 1)
         domain = parts[0].strip()
         user = parts[1].strip()
-        # If domain is a single-letter like "U" coming from some Windows logins,
-        # treat it as domain and still return username without prefix.
-        return user, domain.upper() if domain else None
+        domain = domain.upper() if domain else None
+        # Treat single-letter domains (e.g., "U") as absent to avoid U\ prefix artefact
+        if domain and len(domain) == 1:
+            domain = None
+        return user, domain
 
     if "@" in identity:
         u, realm = identity.split("@", 1)
         domain = realm.split(".")[0].upper() if realm else None
+        if domain and len(domain) == 1:
+            domain = None
         return u, domain
 
     # Fallback - no domain
@@ -166,7 +172,6 @@ class SPNEGOAuthManager:
         async with self._lock:
             if conn_id not in self._contexts:
                 try:
-                    # create server context (pyspnego)
                     self._contexts[conn_id] = spnego.server(service=WNA_SERVICE_NAME, hostname=socket.gethostname())
                 except Exception:
                     logger.exception("SPNEGO context creation failed")
@@ -178,9 +183,6 @@ class SPNEGOAuthManager:
             self._contexts.pop(conn_id, None)
 
     async def step(self, conn_id: str, in_token: Optional[bytes]):
-        """
-        Process a SPNEGO step. Returns tuple (complete: bool, username: Optional[str], out_token: Optional[bytes])
-        """
         if not SPNEGO_AVAILABLE:
             return False, None, None
 
@@ -190,11 +192,9 @@ class SPNEGOAuthManager:
 
         loop = asyncio.get_running_loop()
         try:
-            # Run blocking ctx.step in thread pool
             out_token = await loop.run_in_executor(None, ctx.step, in_token)
             if getattr(ctx, "complete", False):
                 username = str(getattr(ctx, "client_principal", None)) if getattr(ctx, "client_principal", None) else None
-                # cleanup
                 await self.remove(conn_id)
                 return True, username, out_token
             else:
@@ -211,12 +211,21 @@ spnego_manager = SPNEGOAuthManager()
 # ===========================
 class DualAuthProxy:
     def __init__(self):
-        timeout = ClientTimeout(total=BACKEND_TIMEOUT_SECONDS)
-        # Keep-alive connector to backend
-        self._client = ClientSession(connector=TCPConnector(limit=100), timeout=timeout)
+        # ClientSession is created on app startup (inside the running event loop)
+        self._client: Optional[ClientSession] = None
+
+    async def start(self):
+        """Create ClientSession inside running event loop (avoids cross-loop issues)."""
+        if self._client is None:
+            timeout = ClientTimeout(total=BACKEND_TIMEOUT_SECONDS)
+            self._client = ClientSession(connector=TCPConnector(limit=100), timeout=timeout)
+            logger.info("Backend ClientSession created")
 
     async def close(self):
-        await self._client.close()
+        if self._client:
+            await self._client.close()
+            self._client = None
+            logger.info("Backend ClientSession closed")
 
     async def get_peer_cert_der(self, request: web.Request) -> Optional[bytes]:
         """
@@ -228,17 +237,13 @@ class DualAuthProxy:
             if not transport:
                 return None
 
-            # Try getpeercert via ssl_object
             sslobj = transport.get_extra_info("ssl_object")
             if sslobj:
-                # binary_form=True yields DER bytes
                 der = sslobj.getpeercert(binary_form=True)
                 return der
 
-            # Fallback: some servers may expose 'peercert' directly
             peercert = transport.get_extra_info("peercert")
             if peercert:
-                # If peercert is a dict, we cannot reconstruct DER easily
                 return None
         except Exception:
             logger.exception("Could not retrieve peer cert from transport")
@@ -246,10 +251,7 @@ class DualAuthProxy:
 
     async def handle_request(self, request: web.Request) -> web.Response:
         """
-        Main request handler:
-         - Extract client cert (if any)
-         - Optionally perform SPNEGO if no cert (and fallback enabled)
-         - Forward request to backend with proper headers
+        Main request handler.
         """
         client_ip = request.remote
         path_qs = request.raw_path  # includes path + query
@@ -265,7 +267,7 @@ class DualAuthProxy:
         if cert_der:
             username, domain, cert_dn = extract_cert_identity_from_der(cert_der)
             if username:
-                # Strip domain addition from username in final forwarded header
+                # Normalize: drop single-letter domain (already handled in extractor)
                 if domain:
                     auth_user = f"{domain}\\{username}"
                 else:
@@ -277,43 +279,35 @@ class DualAuthProxy:
             if ENABLE_WNA_FALLBACK and SPNEGO_AVAILABLE:
                 auth_hdr = headers.get("Authorization", "")
                 if auth_hdr and auth_hdr.lower().startswith("negotiate"):
-                    # extract token and process via spnego_manager
                     token_b64 = auth_hdr.split(" ", 1)[1] if " " in auth_hdr else ""
                     in_token = base64.b64decode(token_b64) if token_b64 else None
-                    # Use remote peer+port as connection id to keep per-connection context
-                    conn_id = f"{client_ip}:{request.transport.get_extra_info('peername')[1] if request.transport.get_extra_info('peername') else '0'}"
+                    peername = request.transport.get_extra_info("peername") or ()
+                    peer_port = peername[1] if len(peername) > 1 else 0
+                    conn_id = f"{client_ip}:{peer_port}"
                     complete, username, out_token = await spnego_manager.step(conn_id, in_token)
                     if not complete and out_token:
-                        # need additional round - respond with 401 challenge
                         out_b64 = base64.b64encode(out_token).decode()
                         return web.Response(status=401, headers={"WWW-Authenticate": f"Negotiate {out_b64}"}, body=b"")
                     if complete and username:
                         user, domain = parse_wna_identity(username)
-                        auth_user = f"{domain}\\{user}" if domain else user
+                        if domain:
+                            auth_user = f"{domain}\\{user}"
+                        else:
+                            auth_user = user
                         auth_method = "wna"
                         logger.info("[%s] WNA auth: %s", client_ip, auth_user)
                 else:
-                    # No Authorization header - initial Negotiate challenge
-                    # We want the client (browser) to respond with SPNEGO tokens
                     return web.Response(status=401, headers={"WWW-Authenticate": "Negotiate"}, text="401 Authentication Required")
             else:
-                # No authentication available
                 logger.warning("[%s] No auth provided; rejecting", client_ip)
                 return web.Response(status=401, text="Authentication required")
 
-        # Sanitize username before forwarding (remove stray domain prefix like single-letter 'U\')
+        # Sanitize username before forwarding: remove stray leading backslashes
         if auth_user:
-            # Normalize: if format DOMAIN\username, keep it; else ensure no leading backslash
-            if "\\" in auth_user:
-                domain_part, user_part = auth_user.split("\\", 1)
-                # if domain is suspicious (single-letter) we still preserve domain but forward as-is
-                auth_user = f"{domain_part}\\{user_part}"
-            else:
-                auth_user = auth_user.lstrip("\\").strip()
+            auth_user = auth_user.lstrip("\\").strip()
 
         # 3) Build headers for backend
         forward_headers = {}
-        # Copy incoming headers but remove hop-by-hop and Authorization
         hop_by_hop = {
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "te", "trailers", "transfer-encoding", "upgrade", "authorization"
@@ -340,16 +334,18 @@ class DualAuthProxy:
 
         forward_headers[FORWARDED_PROTO_HEADER] = "https"
 
-        # 4) Read body safely (streaming-aware)
+        # 4) Read body safely
         body = await request.read()
 
         # 5) Proxy to backend using aiohttp ClientSession
+        if not self._client:
+            logger.error("Backend ClientSession not initialized")
+            return web.Response(status=502, text="Bad Gateway: proxy backend client not ready")
+
         target_url = f"{BACKEND_BASE}{path_qs}"
         try:
             async with self._client.request(method, target_url, headers=forward_headers, data=body) as resp:
-                # Build response back to client
                 resp_body = await resp.read()
-                # Filter hop-by-hop response headers
                 response_headers = {}
                 for k, v in resp.headers.items():
                     if k.lower() in ("transfer-encoding", "connection"):
@@ -358,7 +354,6 @@ class DualAuthProxy:
                 return web.Response(status=resp.status, body=resp_body, headers=response_headers)
         except ClientConnectionError as e:
             logger.exception("Backend connection failed: %s", e)
-            # Return a clean 502 with explanation to avoid proxy dropping connection
             return web.Response(status=502, text=f"Bad Gateway: backend connection failed: {e}")
         except asyncio.TimeoutError:
             logger.exception("Backend request timed out")
@@ -375,16 +370,26 @@ async def init_app() -> web.Application:
     app = web.Application()
     app["proxy"] = proxy
 
-    # single catch-all route
     async def handler(request):
         return await app["proxy"].handle_request(request)
 
     app.router.add_route("*", "/{path_info:.*}", handler)
+
+    # Lifecycle hooks: create/close ClientSession inside the running loop
+    async def on_startup(app):
+        await app["proxy"].start()
+
+    async def on_cleanup(app):
+        await app["proxy"].close()
+
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
     return app
 
 def create_ssl_context() -> ssl.SSLContext:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.options |= ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+    # NOTE: removed deprecated ctx.options toggles and use minimum_version instead
     # load server cert
     ctx.load_cert_chain(SERVER_CERT_FILE, SERVER_KEY_FILE)
     # client cert verification if CA provided
@@ -400,18 +405,13 @@ def create_ssl_context() -> ssl.SSLContext:
     try:
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     except AttributeError:
-        # older Python - ignore
         pass
     return ctx
 
 def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = loop.run_until_complete(init_app())
+    # Use web.run_app which will create its own loop; sessions created in startup hook use the same loop.
+    app = asyncio.get_event_loop().run_until_complete(init_app())
     ssl_ctx = create_ssl_context()
-
-    # Run aiohttp web server with SSL
     web.run_app(app, host=PROXY_HOST, port=PROXY_PORT, ssl_context=ssl_ctx)
 
 if __name__ == "__main__":
