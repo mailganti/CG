@@ -1,0 +1,43 @@
+# controller/scripts.py additions
+
+import subprocess
+import logging
+import json
+from controller.db.db import get_db
+
+logger = logging.getLogger(__name__)
+
+def run_workflow_script(workflow_id: str, workflow: dict, execution_id: int):
+    """
+    Execute the script referenced by workflow['script_id'].
+    Must return a JSON-serializable result dict (or None).
+    """
+    db = get_db()
+    script_id = workflow.get('script_id')
+    script = db.get_script(script_id)
+    if not script:
+        raise RuntimeError(f"Script {script_id} not found")
+
+    script_path = script.get('script_path')
+    if not script_path or not os.path.exists(script_path):
+        raise RuntimeError(f"Script path missing or not found: {script_path}")
+
+    # For example, run script synchronously and capture output
+    proc = subprocess.run([script_path], capture_output=True, text=True, timeout=3600)
+    stdout = proc.stdout
+    stderr = proc.stderr
+    rc = proc.returncode
+
+    # write logs to a file named by execution_id
+    log_dir = os.getenv('LOG_DIR', 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"execution_{execution_id}.log")
+    with open(log_file, 'w') as f:
+        f.write("STDOUT\n")
+        f.write(stdout or "")
+        f.write("\nSTDERR\n")
+        f.write(stderr or "")
+
+    # update execution record with log file path
+    db.complete_execution_record(execution_id, status="success" if rc == 0 else "failed", result_json=json.dumps({'rc': rc, 'stdout': stdout, 'stderr': stderr}))
+    return {'rc': rc, 'stdout': stdout, 'stderr': stderr}

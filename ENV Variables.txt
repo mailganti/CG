@@ -1,0 +1,10 @@
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_FROM=orchestration@example.com
+SMTP_USERNAME=smtp_user
+SMTP_PASSWORD=smtp_pass
+SMTP_STARTTLS=true
+
+APPROVER_JWT_SECRET=some-very-secret-value
+APPROVER_JWT_ALGO=HS256
+API_HOST=https://orchestration.example.com  # used in email links

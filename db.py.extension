@@ -1,0 +1,139 @@
+import os
+import secrets
+from datetime import timedelta
+
+# below inside OrchestrationDB class
+
+    # -------------------------------
+    # Execution token & approval API
+    # -------------------------------
+
+    def create_execution_approval_request(self, workflow_id: str, requester: str, requester_email: Optional[str] = None, note: str = "") -> Dict[str, Any]:
+        """Create an approval request for re-execution"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO execution_approval_requests (workflow_id, requester, requester_email, requested_at, status, note)
+            VALUES (?, ?, ?, datetime('now'), 'pending', ?)
+        ''', (workflow_id, requester, requester_email or "", note))
+        self.conn.commit()
+        req_id = cursor.lastrowid
+        return self.get_execution_approval_request(req_id)
+
+    def get_execution_approval_request(self, request_id: int) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM execution_approval_requests WHERE id = ?', (request_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def list_pending_approval_requests_for_workflow(self, workflow_id: str) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM execution_approval_requests WHERE workflow_id = ? AND status = "pending" ORDER BY requested_at DESC', (workflow_id,))
+        return [dict(r) for r in cursor.fetchall()]
+
+    def approve_execution_request(self, request_id: int, approver: str) -> Optional[Dict[str, Any]]:
+        """
+        Approve a pending request and generate an execution token.
+        Returns the token row dict.
+        """
+        req = self.get_execution_approval_request(request_id)
+        if not req:
+            return None
+        if req['status'] != 'pending':
+            return None
+
+        # generate token (secure)
+        token_value = secrets.token_urlsafe(24)
+        expires_minutes = None
+        try:
+            # read default TTL from workflows table if present, otherwise 15
+            wf = self.get_workflow(req['workflow_id'])
+            if wf and wf.get('ttl_minutes'):
+                expires_minutes = int(wf.get('ttl_minutes'))
+        except Exception:
+            expires_minutes = None
+
+        if expires_minutes is None:
+            expires_minutes = 15  # default TTL 15 minutes
+
+        expires_at = (datetime.utcnow() + timedelta(minutes=expires_minutes)).isoformat()
+
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO execution_tokens (workflow_id, token, created_by, created_at, expires_at, used)
+            VALUES (?, ?, ?, datetime('now'), ?, 0)
+        ''', (req['workflow_id'], token_value, approver, expires_at))
+        token_id = cursor.lastrowid
+
+        cursor.execute('''
+            UPDATE execution_approval_requests
+            SET status = 'approved', approved_by = ?, approved_at = datetime('now'), token_id = ?
+            WHERE id = ?
+        ''', (approver, token_id, request_id))
+
+        self.conn.commit()
+        return self.get_execution_token_by_id(token_id)
+
+    def reject_execution_request(self, request_id: int, approver: str, note: Optional[str] = None) -> bool:
+        req = self.get_execution_approval_request(request_id)
+        if not req or req['status'] != 'pending':
+            return False
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE execution_approval_requests
+            SET status = 'rejected', approved_by = ?, approved_at = datetime('now'), note = ?
+            WHERE id = ?
+        ''', (approver, note or "", request_id))
+        self.conn.commit()
+        return True
+
+    def get_execution_token_by_id(self, token_id: int) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM execution_tokens WHERE id = ?', (token_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_execution_token_by_value(self, token_value: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM execution_tokens WHERE token = ?', (token_value,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def mark_execution_token_used(self, token_id: int, used_by: str) -> bool:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE execution_tokens SET used = 1, used_at = datetime('now'), used_by = ?
+            WHERE id = ? AND used = 0
+        ''', (used_by, token_id))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def create_execution_record(self, workflow_id: str, user: str, status: str = "running", log_file: Optional[str] = None) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO executions (workflow_id, user, started_at, status, log_file)
+            VALUES (?, ?, datetime('now'), ?, ?)
+        ''', (workflow_id, user, status, log_file))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def complete_execution_record(self, execution_id: int, status: str = "success", result_json: Optional[str] = None):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE executions SET completed_at = datetime('now'), status = ?, result_json = ?
+            WHERE execution_id = ?
+        ''', (status, result_json or "", execution_id))
+        self.conn.commit()
+
+    def get_execution(self, execution_id: int) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM executions WHERE execution_id = ?', (execution_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def get_last_execution_for_workflow(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT * FROM executions WHERE workflow_id = ? ORDER BY started_at DESC LIMIT 1
+        ''', (workflow_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
