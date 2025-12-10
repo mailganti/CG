@@ -1,0 +1,681 @@
+"""
+Dual Authentication SSL Proxy
+=============================
+
+A custom Python proxy that handles both Smart Card (client certificate) and 
+Windows Native Authentication (NTLM/Kerberos) with automatic fallback.
+
+Authentication Flow:
+    1. Client connects with TLS
+    2. If client presents certificate → extract identity from cert
+    3. If no certificate → negotiate NTLM/Kerberos (SPNEGO)
+    4. Pass authenticated identity to FastAPI via X-Auth-User header
+
+Architecture:
+    Browser <--TLS/SPNEGO--> ssl_proxy.py <--HTTP+Headers--> FastAPI (port 8000)
+
+Requirements:
+    pip install pyspnego pyopenssl
+
+Usage:
+    python ssl_proxy.py
+
+Configuration:
+    - Edit AUTH_CONFIG section below
+    - Place SSL certs in ./certs/ directory
+"""
+
+import ssl
+import socket
+import threading
+import select
+import re
+import base64
+import struct
+import logging
+from datetime import datetime
+from typing import Optional, Tuple, Dict
+from dataclasses import dataclass
+from pathlib import Path
+
+# Optional: For Kerberos/NTLM support
+try:
+    import spnego
+    SPNEGO_AVAILABLE = True
+except ImportError:
+    SPNEGO_AVAILABLE = False
+    print("WARNING: spnego not installed. NTLM/Kerberos auth disabled.")
+    print("Install with: pip install pyspnego")
+
+# Optional: For certificate parsing
+try:
+    from OpenSSL import crypto
+    OPENSSL_AVAILABLE = True
+except ImportError:
+    OPENSSL_AVAILABLE = False
+    print("WARNING: pyOpenSSL not installed. Smart card auth disabled.")
+    print("Install with: pip install pyopenssl")
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass
+class AuthConfig:
+    """Authentication configuration"""
+    # Proxy settings
+    LISTEN_HOST: str = "0.0.0.0"
+    LISTEN_PORT: int = 443
+    BACKEND_HOST: str = "127.0.0.1"
+    BACKEND_PORT: int = 8000
+    
+    # SSL/TLS settings
+    SERVER_CERT: str = "./certs/server.crt"
+    SERVER_KEY: str = "./certs/server.key"
+    CA_CHAIN: str = "./certs/ca-chain.crt"  # CA that issued smart card certs
+    
+    # Client certificate settings
+    REQUIRE_CERT: bool = False  # False = optional (allows WNA fallback)
+    VERIFY_CERT: bool = True
+    
+    # Windows Native Auth settings
+    ENABLE_WNA: bool = True
+    WNA_SERVICE_NAME: str = "HTTP"  # Kerberos service name
+    WNA_REALM: str = ""  # e.g., "CORP.LOCAL" - leave empty to auto-detect
+    
+    # Auth behavior
+    ALLOW_ANONYMOUS: bool = False  # Allow unauthenticated requests
+    AUTH_HEADER: str = "X-Auth-User"  # Header to pass identity to backend
+    AUTH_METHOD_HEADER: str = "X-Auth-Method"  # Header indicating auth method used
+    CERT_DN_HEADER: str = "X-Client-DN"  # Full certificate DN
+    
+    # Logging
+    LOG_LEVEL: str = "INFO"
+    LOG_AUTH_SUCCESS: bool = True
+    LOG_AUTH_FAILURE: bool = True
+
+
+AUTH_CONFIG = AuthConfig()
+
+# Setup logging
+logging.basicConfig(
+    level=getattr(logging, AUTH_CONFIG.LOG_LEVEL),
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Authentication Handlers
+# =============================================================================
+
+@dataclass
+class AuthResult:
+    """Result of authentication attempt"""
+    success: bool
+    username: Optional[str] = None
+    domain: Optional[str] = None
+    method: Optional[str] = None  # "smartcard" or "wna"
+    cert_dn: Optional[str] = None
+    error: Optional[str] = None
+    
+    @property
+    def identity(self) -> Optional[str]:
+        """Return full identity string"""
+        if not self.username:
+            return None
+        if self.domain:
+            return f"{self.domain}\\{self.username}"
+        return self.username
+
+
+def extract_cn_from_dn(dn: str) -> Optional[str]:
+    """Extract Common Name from certificate DN"""
+    # DN format: /C=US/O=Org/CN=John Smith/emailAddress=john@example.com
+    # or: CN=John Smith, O=Org, C=US
+    patterns = [
+        r'CN=([^,/]+)',  # Standard format
+        r'/CN=([^/]+)',  # OpenSSL format
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, dn, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def authenticate_certificate(ssl_socket: ssl.SSLSocket) -> AuthResult:
+    """Authenticate via client certificate (Smart Card)"""
+    if not OPENSSL_AVAILABLE:
+        return AuthResult(success=False, error="OpenSSL not available")
+    
+    try:
+        # Get peer certificate in DER format
+        cert_der = ssl_socket.getpeercert(binary_form=True)
+        if not cert_der:
+            return AuthResult(success=False, error="No client certificate presented")
+        
+        # Parse certificate
+        cert = crypto.load_certificate(crypto.FILETYPE_ASN1, cert_der)
+        subject = cert.get_subject()
+        
+        # Extract identity
+        cn = subject.CN
+        email = getattr(subject, 'emailAddress', None)
+        
+        # Build DN string
+        dn_parts = []
+        for key, value in subject.get_components():
+            dn_parts.append(f"{key.decode()}={value.decode()}")
+        dn = ", ".join(dn_parts)
+        
+        # Determine username (prefer CN, fall back to email)
+        username = cn or email
+        if not username:
+            return AuthResult(success=False, error="Certificate has no CN or email")
+        
+        # Check for domain in certificate (some PKI setups include it)
+        org = subject.O
+        domain = org.split('.')[0].upper() if org else None
+        
+        return AuthResult(
+            success=True,
+            username=username,
+            domain=domain,
+            method="smartcard",
+            cert_dn=dn
+        )
+        
+    except Exception as e:
+        logger.error(f"Certificate auth error: {e}")
+        return AuthResult(success=False, error=str(e))
+
+
+class SPNEGOAuthenticator:
+    """Handle SPNEGO (Kerberos/NTLM) authentication"""
+    
+    def __init__(self):
+        self.contexts: Dict[str, any] = {}  # Track auth contexts by connection
+    
+    def authenticate(self, auth_header: str, connection_id: str) -> Tuple[AuthResult, Optional[str]]:
+        """
+        Process SPNEGO authentication.
+        
+        Returns:
+            Tuple of (AuthResult, challenge_header)
+            - If challenge_header is not None, send 401 with WWW-Authenticate header
+            - If AuthResult.success, authentication complete
+        """
+        if not SPNEGO_AVAILABLE:
+            return AuthResult(success=False, error="SPNEGO not available"), None
+        
+        try:
+            # Get or create auth context
+            if connection_id not in self.contexts:
+                self.contexts[connection_id] = spnego.server(
+                    service=AUTH_CONFIG.WNA_SERVICE_NAME,
+                    hostname=socket.gethostname()
+                )
+            
+            ctx = self.contexts[connection_id]
+            
+            # Parse incoming token
+            if auth_header and auth_header.lower().startswith('negotiate '):
+                in_token = base64.b64decode(auth_header[10:])
+            else:
+                in_token = None
+            
+            # Process token
+            out_token = ctx.step(in_token)
+            
+            if ctx.complete:
+                # Authentication successful
+                username = ctx.client_principal
+                # Parse domain\user or user@domain
+                if '\\' in username:
+                    domain, user = username.split('\\', 1)
+                elif '@' in username:
+                    user, domain = username.split('@', 1)
+                    domain = domain.split('.')[0].upper()
+                else:
+                    user, domain = username, None
+                
+                # Clean up context
+                del self.contexts[connection_id]
+                
+                return AuthResult(
+                    success=True,
+                    username=user,
+                    domain=domain,
+                    method="wna"
+                ), None
+            else:
+                # Need another round - send challenge
+                challenge = f"Negotiate {base64.b64encode(out_token).decode()}"
+                return AuthResult(success=False, error="Continue"), challenge
+                
+        except Exception as e:
+            logger.error(f"SPNEGO auth error: {e}")
+            if connection_id in self.contexts:
+                del self.contexts[connection_id]
+            return AuthResult(success=False, error=str(e)), None
+
+
+# Global SPNEGO authenticator
+spnego_auth = SPNEGOAuthenticator()
+
+
+# =============================================================================
+# HTTP Parsing Utilities
+# =============================================================================
+
+def parse_http_request(data: bytes) -> Tuple[str, Dict[str, str], bytes]:
+    """Parse HTTP request into method/path, headers, and body"""
+    try:
+        # Split headers and body
+        if b'\r\n\r\n' in data:
+            header_data, body = data.split(b'\r\n\r\n', 1)
+        else:
+            header_data, body = data, b''
+        
+        lines = header_data.decode('utf-8', errors='replace').split('\r\n')
+        request_line = lines[0] if lines else ''
+        
+        headers = {}
+        for line in lines[1:]:
+            if ':' in line:
+                key, value = line.split(':', 1)
+                headers[key.strip()] = value.strip()
+        
+        return request_line, headers, body
+    except Exception as e:
+        logger.error(f"Error parsing HTTP request: {e}")
+        return '', {}, b''
+
+
+def build_http_response(status: int, status_text: str, headers: Dict[str, str], body: bytes = b'') -> bytes:
+    """Build HTTP response"""
+    response = f"HTTP/1.1 {status} {status_text}\r\n"
+    headers['Content-Length'] = str(len(body))
+    for key, value in headers.items():
+        response += f"{key}: {value}\r\n"
+    response += "\r\n"
+    return response.encode() + body
+
+
+def inject_auth_headers(request_data: bytes, auth_result: AuthResult) -> bytes:
+    """Inject authentication headers into HTTP request"""
+    try:
+        request_line, headers, body = parse_http_request(request_data)
+        
+        # Add auth headers
+        if auth_result.identity:
+            headers[AUTH_CONFIG.AUTH_HEADER] = auth_result.identity
+        if auth_result.method:
+            headers[AUTH_CONFIG.AUTH_METHOD_HEADER] = auth_result.method
+        if auth_result.cert_dn:
+            headers[AUTH_CONFIG.CERT_DN_HEADER] = auth_result.cert_dn
+        
+        # Rebuild request
+        new_request = f"{request_line}\r\n"
+        for key, value in headers.items():
+            new_request += f"{key}: {value}\r\n"
+        new_request += "\r\n"
+        
+        return new_request.encode() + body
+    except Exception as e:
+        logger.error(f"Error injecting headers: {e}")
+        return request_data
+
+
+# =============================================================================
+# Connection Handler
+# =============================================================================
+
+class ConnectionHandler(threading.Thread):
+    """Handle a single client connection"""
+    
+    def __init__(self, client_socket: ssl.SSLSocket, client_addr: tuple):
+        super().__init__(daemon=True)
+        self.client_socket = client_socket
+        self.client_addr = client_addr
+        self.connection_id = f"{client_addr[0]}:{client_addr[1]}:{datetime.now().timestamp()}"
+        self.auth_result: Optional[AuthResult] = None
+        self.backend_socket: Optional[socket.socket] = None
+    
+    def run(self):
+        try:
+            # Step 1: Try certificate authentication
+            self.auth_result = authenticate_certificate(self.client_socket)
+            
+            if self.auth_result.success:
+                if AUTH_CONFIG.LOG_AUTH_SUCCESS:
+                    logger.info(f"[{self.client_addr[0]}] Smart Card auth: {self.auth_result.identity}")
+                self.proxy_connection()
+                return
+            
+            # Step 2: Fall back to WNA if enabled
+            if AUTH_CONFIG.ENABLE_WNA and SPNEGO_AVAILABLE:
+                self.handle_wna_auth()
+                return
+            
+            # Step 3: Check if anonymous allowed
+            if AUTH_CONFIG.ALLOW_ANONYMOUS:
+                self.auth_result = AuthResult(success=True, method="anonymous")
+                self.proxy_connection()
+                return
+            
+            # No auth available
+            if AUTH_CONFIG.LOG_AUTH_FAILURE:
+                logger.warning(f"[{self.client_addr[0]}] Authentication required but not provided")
+            self.send_auth_required()
+            
+        except Exception as e:
+            logger.error(f"[{self.client_addr[0]}] Connection error: {e}")
+        finally:
+            self.cleanup()
+    
+    def handle_wna_auth(self):
+        """Handle Windows Native Authentication (multi-round SPNEGO)"""
+        try:
+            # Read initial request
+            request_data = self.receive_request()
+            if not request_data:
+                return
+            
+            request_line, headers, body = parse_http_request(request_data)
+            auth_header = headers.get('Authorization', '')
+            
+            # Process SPNEGO
+            self.auth_result, challenge = spnego_auth.authenticate(auth_header, self.connection_id)
+            
+            if challenge:
+                # Send 401 with challenge
+                response = build_http_response(
+                    401, 'Unauthorized',
+                    {
+                        'WWW-Authenticate': challenge,
+                        'Connection': 'keep-alive'
+                    }
+                )
+                self.client_socket.sendall(response)
+                
+                # Wait for client response with token
+                request_data = self.receive_request()
+                if request_data:
+                    request_line, headers, body = parse_http_request(request_data)
+                    auth_header = headers.get('Authorization', '')
+                    self.auth_result, _ = spnego_auth.authenticate(auth_header, self.connection_id)
+            
+            if self.auth_result and self.auth_result.success:
+                if AUTH_CONFIG.LOG_AUTH_SUCCESS:
+                    logger.info(f"[{self.client_addr[0]}] WNA auth: {self.auth_result.identity}")
+                # Re-inject the original request with auth headers
+                self.proxy_request(request_data)
+            else:
+                if AUTH_CONFIG.LOG_AUTH_FAILURE:
+                    logger.warning(f"[{self.client_addr[0]}] WNA auth failed: {self.auth_result.error if self.auth_result else 'Unknown'}")
+                self.send_auth_required()
+                
+        except Exception as e:
+            logger.error(f"[{self.client_addr[0]}] WNA error: {e}")
+            self.send_auth_required()
+    
+    def receive_request(self) -> Optional[bytes]:
+        """Receive HTTP request from client"""
+        try:
+            self.client_socket.settimeout(30)
+            data = b''
+            while True:
+                chunk = self.client_socket.recv(8192)
+                if not chunk:
+                    break
+                data += chunk
+                # Check if we have complete headers
+                if b'\r\n\r\n' in data:
+                    # Check Content-Length for body
+                    match = re.search(rb'Content-Length:\s*(\d+)', data, re.IGNORECASE)
+                    if match:
+                        content_length = int(match.group(1))
+                        header_end = data.index(b'\r\n\r\n') + 4
+                        body_received = len(data) - header_end
+                        if body_received >= content_length:
+                            break
+                    else:
+                        break
+            return data if data else None
+        except socket.timeout:
+            return None
+        except Exception as e:
+            logger.error(f"Error receiving request: {e}")
+            return None
+    
+    def proxy_connection(self):
+        """Proxy the entire connection after authentication"""
+        try:
+            self.backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.backend_socket.connect((AUTH_CONFIG.BACKEND_HOST, AUTH_CONFIG.BACKEND_PORT))
+            
+            # Bidirectional proxy
+            self.client_socket.setblocking(False)
+            self.backend_socket.setblocking(False)
+            
+            while True:
+                readable, _, _ = select.select([self.client_socket, self.backend_socket], [], [], 30)
+                
+                if not readable:
+                    break
+                
+                for sock in readable:
+                    try:
+                        data = sock.recv(65536)
+                        if not data:
+                            return
+                        
+                        if sock is self.client_socket:
+                            # Client -> Backend: inject auth headers
+                            data = inject_auth_headers(data, self.auth_result)
+                            self.backend_socket.sendall(data)
+                        else:
+                            # Backend -> Client
+                            self.client_socket.sendall(data)
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                        continue
+                    except Exception:
+                        return
+                        
+        except Exception as e:
+            logger.error(f"Proxy error: {e}")
+    
+    def proxy_request(self, request_data: bytes):
+        """Proxy a single request after WNA auth"""
+        try:
+            self.backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.backend_socket.connect((AUTH_CONFIG.BACKEND_HOST, AUTH_CONFIG.BACKEND_PORT))
+            
+            # Inject auth headers and forward
+            data = inject_auth_headers(request_data, self.auth_result)
+            self.backend_socket.sendall(data)
+            
+            # Get response
+            response = b''
+            self.backend_socket.settimeout(30)
+            while True:
+                try:
+                    chunk = self.backend_socket.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+                except socket.timeout:
+                    break
+            
+            # Send to client
+            if response:
+                self.client_socket.sendall(response)
+            
+            # Continue proxying
+            self.proxy_connection()
+            
+        except Exception as e:
+            logger.error(f"Proxy request error: {e}")
+    
+    def send_auth_required(self):
+        """Send 401 response requiring authentication"""
+        headers = {'Content-Type': 'text/html'}
+        
+        if AUTH_CONFIG.ENABLE_WNA and SPNEGO_AVAILABLE:
+            headers['WWW-Authenticate'] = 'Negotiate'
+        
+        body = b'<html><body><h1>401 Authentication Required</h1></body></html>'
+        response = build_http_response(401, 'Unauthorized', headers, body)
+        
+        try:
+            self.client_socket.sendall(response)
+        except Exception:
+            pass
+    
+    def cleanup(self):
+        """Clean up sockets"""
+        try:
+            self.client_socket.close()
+        except Exception:
+            pass
+        try:
+            if self.backend_socket:
+                self.backend_socket.close()
+        except Exception:
+            pass
+
+
+# =============================================================================
+# Main Server
+# =============================================================================
+
+class DualAuthProxy:
+    """Main proxy server supporting Smart Card and WNA"""
+    
+    def __init__(self, config: AuthConfig = AUTH_CONFIG):
+        self.config = config
+        self.ssl_context = self._create_ssl_context()
+        self.server_socket = None
+        self.running = False
+    
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        """Create SSL context for TLS with optional client certs"""
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        
+        # Load server certificate
+        context.load_cert_chain(
+            self.config.SERVER_CERT,
+            self.config.SERVER_KEY
+        )
+        
+        # Client certificate settings
+        if Path(self.config.CA_CHAIN).exists():
+            context.load_verify_locations(self.config.CA_CHAIN)
+            if self.config.REQUIRE_CERT:
+                context.verify_mode = ssl.CERT_REQUIRED
+            else:
+                context.verify_mode = ssl.CERT_OPTIONAL  # Allow WNA fallback
+        else:
+            context.verify_mode = ssl.CERT_NONE
+            logger.warning(f"CA chain not found: {self.config.CA_CHAIN}")
+            logger.warning("Client certificate authentication disabled")
+        
+        # Modern TLS settings
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers('ECDHE+AESGCM:DHE+AESGCM:ECDHE+CHACHA20')
+        
+        return context
+    
+    def start(self):
+        """Start the proxy server"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.config.LISTEN_HOST, self.config.LISTEN_PORT))
+        self.server_socket.listen(100)
+        
+        self.running = True
+        
+        logger.info("=" * 60)
+        logger.info("Dual Authentication SSL Proxy")
+        logger.info("=" * 60)
+        logger.info(f"Listening on: {self.config.LISTEN_HOST}:{self.config.LISTEN_PORT}")
+        logger.info(f"Backend: {self.config.BACKEND_HOST}:{self.config.BACKEND_PORT}")
+        logger.info(f"Smart Card Auth: {'Enabled' if OPENSSL_AVAILABLE else 'Disabled'}")
+        logger.info(f"Windows Native Auth: {'Enabled' if (self.config.ENABLE_WNA and SPNEGO_AVAILABLE) else 'Disabled'}")
+        logger.info(f"Anonymous Access: {'Allowed' if self.config.ALLOW_ANONYMOUS else 'Denied'}")
+        logger.info("=" * 60)
+        
+        try:
+            while self.running:
+                try:
+                    client_socket, client_addr = self.server_socket.accept()
+                    
+                    # Wrap with SSL
+                    try:
+                        ssl_socket = self.ssl_context.wrap_socket(
+                            client_socket,
+                            server_side=True
+                        )
+                        
+                        # Start handler thread
+                        handler = ConnectionHandler(ssl_socket, client_addr)
+                        handler.start()
+                        
+                    except ssl.SSLError as e:
+                        logger.debug(f"SSL handshake failed from {client_addr}: {e}")
+                        client_socket.close()
+                        
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Accept error: {e}")
+                        
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Stop the proxy server"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Dual Authentication SSL Proxy")
+    parser.add_argument("--port", type=int, default=443, help="Listen port")
+    parser.add_argument("--backend-port", type=int, default=8000, help="Backend FastAPI port")
+    parser.add_argument("--cert", default="./certs/server.crt", help="Server certificate")
+    parser.add_argument("--key", default="./certs/server.key", help="Server private key")
+    parser.add_argument("--ca", default="./certs/ca-chain.crt", help="CA chain for client certs")
+    parser.add_argument("--no-wna", action="store_true", help="Disable Windows Native Auth")
+    parser.add_argument("--allow-anonymous", action="store_true", help="Allow unauthenticated access")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    
+    args = parser.parse_args()
+    
+    # Update config
+    AUTH_CONFIG.LISTEN_PORT = args.port
+    AUTH_CONFIG.BACKEND_PORT = args.backend_port
+    AUTH_CONFIG.SERVER_CERT = args.cert
+    AUTH_CONFIG.SERVER_KEY = args.key
+    AUTH_CONFIG.CA_CHAIN = args.ca
+    AUTH_CONFIG.ENABLE_WNA = not args.no_wna
+    AUTH_CONFIG.ALLOW_ANONYMOUS = args.allow_anonymous
+    
+    if args.debug:
+        AUTH_CONFIG.LOG_LEVEL = "DEBUG"
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Start proxy
+    proxy = DualAuthProxy(AUTH_CONFIG)
+    proxy.start()
