@@ -1,3 +1,9 @@
 Smart Card auth: Rajesh Mudiganti (affiliate)
  ERROR - Proxy error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
  code 502, message Bad Gateway: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
+
+
+
+from fastapi.staticfiles import StaticFiles
+
+app.mount("/", StaticFiles(directory="dashboard/dist", html=True), name="static")
