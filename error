@@ -1,0 +1,3 @@
+2025-12-10 11:45:07,311 - ssl_proxy - INFO - [170.20.254.138] Smart Card auth: U\Jon Albano (affiliate)
+2025-12-10 11:45:07,312 - ssl_proxy - ERROR - Proxy error: Remote end closed connection without response
+2025-12-10 11:45:07,312 - ssl_proxy - INFO - 170.20.254.138 - code 502, message Bad Gateway: Remote end closed connection without response
