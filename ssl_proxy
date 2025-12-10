@@ -24,11 +24,12 @@ except ImportError:
 
 # Proxy server configuration
 PROXY_HOST = '10.28.203.100'   # Listen on this IP
-PROXY_PORT = 7605              # Listen on this port
+PROXY_PORT = 7585              # Listen on this port (clients connect here)
 
 # Backend server configuration
-BACKEND_HOST = '127.0.0.1'     # Uvicorn backend
-BACKEND_PORT = 8000            # Uvicorn port
+BACKEND_HOST = '127.0.0.1'     # Hypercorn backend
+BACKEND_PORT = 7605            # Hypercorn port
+BACKEND_SSL = True             # Backend uses HTTPS
 
 # SSL/TLS configuration
 SERVER_CERT_FILE = 'controller/certs/cert.pem'       # Server certificate
@@ -293,8 +294,19 @@ class DualAuthProxyHandler(http.server.BaseHTTPRequestHandler):
             if not self._authenticate():
                 return  # 401 already sent
             
-            # Connect to backend
-            conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=30)
+            # Connect to backend (HTTP or HTTPS)
+            if BACKEND_SSL:
+                # Create unverified context for internal backend
+                import ssl as ssl_internal
+                backend_ctx = ssl_internal._create_unverified_context()
+                conn = http.client.HTTPSConnection(
+                    BACKEND_HOST, 
+                    BACKEND_PORT, 
+                    timeout=30, 
+                    context=backend_ctx
+                )
+            else:
+                conn = http.client.HTTPConnection(BACKEND_HOST, BACKEND_PORT, timeout=30)
             
             # Build path with query string
             path = self.path
