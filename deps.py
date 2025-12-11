@@ -1,236 +1,201 @@
-
-# controller/deps.py - With Session + Token Authentication
-
 """
-Authentication and authorization dependencies
-Supports: API tokens (admin/agent) AND web session cookies
+controller/deps.py
+
+Authentication / Authorization dependencies for the Orchestration System.
+Uses ONLY Smart Card / Windows Auth forwarded headers, merged with DB user roles.
 """
 
-from fastapi import Header, HTTPException, status, Depends, Request
-from typing import Optional
+from __future__ import annotations
+
+import os
+import re
 import logging
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import jwt
+from fastapi import Request, Header, Depends, HTTPException, status
+
+from controller.db.db import get_db
 
 logger = logging.getLogger(__name__)
 
-# Import database
-from controller.db.db import get_db
-from controller.auth.user_auth import UserAuth
+APPROVER_JWT_SECRET = os.getenv("APPROVER_JWT_SECRET", "change-me")
+APPROVER_JWT_ALGO = os.getenv("APPROVER_JWT_ALGO", "HS256")
 
 
-def verify_token(
-    request: Request,
-    x_admin_token: Optional[str] = Header(None),
-    x_agent_token: Optional[str] = Header(None)
-) -> dict:
+# -------------------------------------------------------------
+# Identity Normalization
+# -------------------------------------------------------------
+def normalize_identity(raw: str) -> str:
     """
-    Verify authentication via token OR session
-    
-    Supports three authentication methods:
-    1. API admin tokens (X-Admin-Token header)
-    2. API agent tokens (X-Agent-Token header)  
-    3. Web session cookies (from login)
+    Convert arbitrary identity strings into a clean username.
+
+    Examples:
+      'U\\Rajesh Mudiganti (affiliate)' → 'Rajesh Mudiganti'
+      'DOMAIN\\jsmith' → 'jsmith'
+      'jsmith@acme.com' → 'jsmith'
     """
-    db = get_db()
-    
-    # Method 1: Check admin token (API authentication)
-    if x_admin_token:
-        token = db.get_token_by_value(x_admin_token)
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid admin token"
-            )
-        
-        if token.get('revoked'):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has been revoked"
-            )
-        
-        # Update last used
-        db.update_token_last_used(token['token_name'])
-        
-        return {
-            'token_name': token['token_name'],
-            'role': token.get('role', 'viewer'),
-            'token_type': 'admin',
-            'auth_method': 'api_token'
-        }
-    
-    # Method 2: Check agent token (Agent authentication)
-    elif x_agent_token:
-        token = db.get_token_by_value(x_agent_token)
-        if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid agent token"
-            )
-        
-        if token.get('revoked'):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token has been revoked"
-            )
-        
-        # Verify it's actually an agent token
-        if token.get('role') != 'agent':
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Token is not an agent token"
-            )
-        
-        # Update last used
-        db.update_token_last_used(token['token_name'])
-        
-        return {
-            'token_name': token['token_name'],
-            'role': 'agent',
-            'token_type': 'agent',
-            'auth_method': 'api_token'
-        }
-    
-    # Method 3: Check session cookie (Web authentication)
-    else:
-        # Try to get user from session
-        try:
-            from controller.auth.web_auth import get_current_user_from_session
-            
-            session_cookie = request.cookies.get("orchestration_session")
-            user = get_current_user_from_session(request, session_cookie)
-            
-            if user:
-                # User authenticated via web session
-                logger.info(f"Web user authenticated: {user['username']} (role: {user['role']})")
-                return {
-                    'username': user['username'],
-                    'role': user['role'],
-                    'token_type': 'session',
-                    'auth_method': 'web_session',
-                    'user_id': user.get('user_id'),
-                    'full_name': user.get('full_name')
-                }
-        except ImportError:
-            # web_auth module not available
-            pass
-        except Exception as e:
-            logger.error(f"Session authentication error: {e}")
-        
-        # No valid authentication method found
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="No authentication token provided"
-        )
+    if not raw:
+        return ""
+
+    s = raw.strip()
+
+    # Remove quotes
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # Remove any trailing parentheses text
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+
+    # DOMAIN\username → username
+    if "\\" in s:
+        s = s.split("\\", 1)[1].strip()
+
+    # user@domain.com → user
+    if "@" in s:
+        s = s.split("@", 1)[0]
+
+    # Remove weird U\ prefix again if still present
+    s = re.sub(r"^[A-Za-z]\\", "", s).strip()
+
+    # Collapse double spaces
+    s = re.sub(r"\s+", " ", s)
+
+    return s
 
 
-def require_role(*allowed_roles: str):
+# -------------------------------------------------------------
+# Build runtime user from proxy headers + DB role merge
+# -------------------------------------------------------------
+def get_runtime_user_from_request(request: Request) -> Optional[Dict[str, Any]]:
     """
-    Dependency to require specific roles
-    
-    Works with both API tokens and web sessions
-    
-    Usage:
-        @router.get("/admin-only")
-        async def admin_endpoint(user: dict = Depends(require_role("admin"))):
-            ...
-    """
-    def role_checker(user: dict = Depends(verify_token)) -> dict:
-        if user['role'] not in allowed_roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Requires one of: {', '.join(allowed_roles)}"
-            )
-        return user
-    
-    return role_checker
+    Build a unified user object:
+        - read identity from Smart Card / WNA headers
+        - normalize it
+        - merge with DB user for role + user_id
 
-
-def require_admin(user: dict = Depends(verify_token)) -> dict:
+    Returns None if no identity found.
     """
-    Require admin role
-    
-    Works with both API tokens and web sessions
-    """
-    if user['role'] != 'admin':
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    return user
+    hdr_user = (
+        request.headers.get("X-Auth-User")
+        or request.headers.get("X-Forwarded-User")
+        or request.headers.get("X-Remote-User")
+    )
 
-
-def require_agent(user: dict = Depends(verify_token)) -> dict:
-    """
-    Require agent role (for agent-only endpoints like heartbeat)
-    
-    Only works with agent API tokens
-    """
-    if user['role'] != 'agent':
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Agent access required"
-        )
-    return user
-
-
-async def require_approver(user: RuntimeUser = Depends(require_auth)):
-    """
-    Require approver or admin role
-    
-    Works with both API tokens and web sessions
-    """
-       
-    if user['role'] not in ['approver', 'admin']:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Approver or admin access required"
-        )
-    return user
-
-async def get_current_user(request: Request) -> Optional[RuntimeUser]:
-    # extract identity from headers
-    dual_user = await get_proxy_identity(request)
-    if not dual_user:
+    if not hdr_user:
         return None
 
-    # lookup DB user using CN or username
-    db = get_db()
-    user_auth = UserAuth(db)
-    db_user = user_auth.get_user_by_username(dual_user.username)
+    normalized = normalize_identity(hdr_user)
 
-    if db_user:
-        # merge the role into runtime user
-        dual_user.role = db_user["role"]
-        dual_user.user_id = db_user["user_id"]
-    
-    return dual_user
-
-# Deprecated - for backward compatibility
-def verify_admin_token(x_admin_token: str = Header(...)) -> dict:
-    """
-    DEPRECATED: Use verify_token with require_admin instead
-    
-    This function is kept for backward compatibility but will be removed
-    """
-    logger.warning("Using deprecated verify_admin_token - use verify_token with require_admin instead")
-    db = get_db()
-    
-    token = db.get_token_by_value(x_admin_token)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid admin token"
-        )
-    
-    if token.get('revoked'):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has been revoked"
-        )
-    
-    # Update last used
-    db.update_token_last_used(token['token_name'])
-    
-    return {
-        'token_name': token['token_name'],
-        'role': token.get('role', 'viewer')
+    runtime_user = {
+        "username": normalized,
+        "display_name": normalized.replace(".", " ").replace("_", " ").title(),
+        "role": None,
+        "user_id": None,
+        "auth_method": request.headers.get("X-Auth-Method") or "proxy",
     }
+
+    # Merge with DB user record
+    try:
+        db = get_db()
+        user = db.get_user_by_username(normalized)
+        if user:
+            runtime_user["role"] = user.get("role")
+            runtime_user["user_id"] = user.get("user_id") or user.get("id")
+            runtime_user["display_name"] = user.get("full_name") or runtime_user["display_name"]
+    except Exception:
+        logger.exception("Failed to merge user with DB")
+
+    return runtime_user
+
+
+# -------------------------------------------------------------
+# Dependencies
+# -------------------------------------------------------------
+def require_authenticated_user(request: Request) -> Dict[str, Any]:
+    user = get_runtime_user_from_request(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def require_admin(request: Request, user=Depends(require_authenticated_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+def require_approver(request: Request, user=Depends(require_authenticated_user)):
+    if user.get("role") not in ("approver", "admin"):
+        raise HTTPException(status_code=403, detail="Approver access required")
+    return user
+
+
+# -------------------------------------------------------------
+# Approver JWT for workflow approvals
+# -------------------------------------------------------------
+def verify_approver_jwt(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    if not authorization:
+        raise HTTPException(401, "Missing Authorization header")
+
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Invalid Authorization header")
+
+    token = authorization.split(" ", 1)[1].strip()
+
+    try:
+        payload = jwt.decode(token, APPROVER_JWT_SECRET, algorithms=[APPROVER_JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Approver token expired")
+    except Exception:
+        raise HTTPException(401, "Invalid approver token")
+
+    if payload.get("role") not in ("approver", "admin"):
+        raise HTTPException(403, "Approver role required")
+
+    return payload
+
+
+# -------------------------------------------------------------
+# Execution Token Dependency (One-Time Tokens)
+# -------------------------------------------------------------
+def require_execution_token(workflow_id: str):
+    def _dep(
+        token: Optional[str] = Header(None, alias="X-Execution-Token"),
+        user=Depends(require_authenticated_user),
+    ):
+        if not token:
+            raise HTTPException(403, "Execution token required")
+
+        db = get_db()
+        token_row = db.get_execution_token_by_value(token)
+        if not token_row:
+            raise HTTPException(403, "Invalid execution token")
+
+        # workflow match
+        if str(token_row.get("workflow_id")) != str(workflow_id):
+            raise HTTPException(403, "Token not valid for this workflow")
+
+        # used?
+        if token_row.get("used"):
+            raise HTTPException(403, "Token already used")
+
+        # expired?
+        expires_at = token_row.get("expires_at")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(expires_at)
+                if exp < datetime.utcnow():
+                    raise HTTPException(403, "Token expired")
+            except Exception:
+                logger.error("Invalid expires_at format: %s", expires_at)
+
+        # mark used
+        ok = db.mark_execution_token_used(token_row["id"], user["username"])
+        if not ok:
+            raise HTTPException(403, "Token could not be consumed")
+
+        return token_row
+
+    return _dep
