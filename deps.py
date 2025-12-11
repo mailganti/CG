@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Import database
 from controller.db.db import get_db
+from controller.auth.user_auth import UserAuth
 
 
 def verify_token(
@@ -171,12 +172,13 @@ def require_agent(user: dict = Depends(verify_token)) -> dict:
     return user
 
 
-def require_approver(user: dict = Depends(verify_token)) -> dict:
+async def require_approver(user: RuntimeUser = Depends(require_auth)):
     """
     Require approver or admin role
     
     Works with both API tokens and web sessions
     """
+       
     if user['role'] not in ['approver', 'admin']:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -184,6 +186,23 @@ def require_approver(user: dict = Depends(verify_token)) -> dict:
         )
     return user
 
+async def get_current_user(request: Request) -> Optional[RuntimeUser]:
+    # extract identity from headers
+    dual_user = await get_proxy_identity(request)
+    if not dual_user:
+        return None
+
+    # lookup DB user using CN or username
+    db = get_db()
+    user_auth = UserAuth(db)
+    db_user = user_auth.get_user_by_username(dual_user.username)
+
+    if db_user:
+        # merge the role into runtime user
+        dual_user.role = db_user["role"]
+        dual_user.user_id = db_user["user_id"]
+    
+    return dual_user
 
 # Deprecated - for backward compatibility
 def verify_admin_token(x_admin_token: str = Header(...)) -> dict:
