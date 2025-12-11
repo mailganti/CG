@@ -1,17 +1,5 @@
-Smart Card auth: Rajesh Mudiganti (affiliate)
- ERROR - Proxy error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
- code 502, message Bad Gateway: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
-
-
-
-from fastapi.staticfiles import StaticFiles
-
-app.mount("/", StaticFiles(directory="dashboard/dist", html=True), name="static")
-
-
-
-from fastapi.responses import FileResponse
-
-@app.get("/")
-async def root():
-    return FileResponse("dashboard/dist/index.html")
+ controller.routes.scripts - ERROR -❌ HTTP error on ds-d1-ebs-01: 502 - Agent communication error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
+ controller.routes.scripts - INFO - Execution complete: 0 succeeded, 1 failed
+ controller.routes.scripts - ERROR - Failed agents:
+ controller.routes.scripts - ERROR -   - study-pc: HTTP 502: Agent communication error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1000)
+ controller.routes.scripts - INFO - Execution complete: 0 succeeded, 1 failed
