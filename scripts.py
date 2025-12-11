@@ -38,7 +38,10 @@ SSL_CA_CERTS = os.getenv("SSL_CA_CERTS", "./certs/certChain.pem")
 SCRIPTS_BASE_PATH = os.getenv("SCRIPTS_BASE_PATH", "/opt/orchestration/scripts")
 
 # Log SSL configuration at startup
-logger.info(f"[SSL] Scripts route - SSL_ENABLED: {SSL_ENABLED}, SSL_VERIFY: {SSL_VERIFY}")
+logger.info(f"[SSL] Scripts route config:")
+logger.info(f"[SSL]   SSL_ENABLED = {SSL_ENABLED} (env: {os.getenv('SSL_ENABLED', 'not set')})")
+logger.info(f"[SSL]   SSL_VERIFY = {SSL_VERIFY} (env: {os.getenv('SSL_VERIFY', 'not set')})")
+logger.info(f"[SSL]   SSL_CA_CERTS = {SSL_CA_CERTS}")
 
 
 def run_workflow_script(workflow_id: str, workflow: dict, execution_id: int):
@@ -145,11 +148,19 @@ def validate_script_exists(script_path: str) -> bool:
 
 def get_ssl_verify_config():
     """Get SSL verification config for httpx client"""
+    # If SSL_VERIFY is False, explicitly return False to disable verification
     if not SSL_VERIFY:
+        logger.debug("[SSL] Certificate verification DISABLED")
         return False
+    
+    # If we have CA certs and they exist, use them
     if SSL_CA_CERTS and os.path.exists(SSL_CA_CERTS):
+        logger.debug(f"[SSL] Using CA certs: {SSL_CA_CERTS}")
         return SSL_CA_CERTS
-    return False  # Fall back to no verification if CA certs not found
+    
+    # Fall back to no verification
+    logger.debug("[SSL] No CA certs found, verification DISABLED")
+    return False
 
 
 async def send_execution_to_agent(
@@ -171,10 +182,11 @@ async def send_execution_to_agent(
     protocol = "https" if use_ssl else "http"
     url = f"{protocol}://{agent_host}:{agent_port}/execute"
     
-    # Configure SSL verification
-    verify_ssl = get_ssl_verify_config()
+    # IMPORTANT: For self-signed certs, set verify=False explicitly
+    verify_ssl = False if not SSL_VERIFY else get_ssl_verify_config()
     
-    logger.info(f"[SSL] Connecting to agent: {url} (verify={verify_ssl})")
+    logger.info(f"[SSL] Connecting to agent: {url}")
+    logger.info(f"[SSL] SSL_VERIFY={SSL_VERIFY}, verify_ssl={verify_ssl}")
     
     payload = {
         "script_path": script_path,
@@ -184,6 +196,7 @@ async def send_execution_to_agent(
     }
     
     try:
+        # Create client with explicit SSL settings
         async with httpx.AsyncClient(timeout=timeout + 10, verify=verify_ssl) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
@@ -191,6 +204,7 @@ async def send_execution_to_agent(
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail=f"Agent execution timeout after {timeout}s")
     except httpx.HTTPError as e:
+        logger.error(f"[SSL] HTTP Error details: {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Agent communication error: {str(e)}")
 
 
