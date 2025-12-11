@@ -183,6 +183,8 @@
         }
         .form-input:focus { border-color: var(--sky-400); box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2); }
         .form-input::placeholder { color: var(--text-muted); }
+        select.form-input { cursor: pointer; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10l-5 5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 0.5rem center; padding-right: 1.5rem; }
+        select.form-input option { background: #0f172a; color: var(--text-primary); }
 
         /* Agent Selector */
         .agent-selector { max-height: 140px; overflow: auto; border-radius: 0.5rem; border: 1px solid var(--border-input); background: var(--slate-bg-90); padding: 0.5rem; }
@@ -283,7 +285,7 @@
                 <div class="form-section">
                     <div class="form-title">New Workflow</div>
                     <div class="form-grid">
-                        <div class="form-group"><div class="form-label">Script ID</div><input type="text" class="form-input" id="wfScriptId" placeholder="backup_db_prod"></div>
+                        <div class="form-group"><div class="form-label">Script ID</div><select class="form-input" id="wfScriptId"><option value="">Loading scripts...</option></select></div>
                         <div class="form-group"><div class="form-label">Requestor</div><input type="text" class="form-input" id="wfRequestor" value="" readonly></div>
                         <div class="form-group full">
                             <div class="form-label">Target Agents (<span id="selectedCount">0</span> selected)</div>
@@ -350,9 +352,9 @@
 
     <script>
         const API_BASE = '/api';
-        let currentUser = null, workflows = [], agents = [], selectedAgents = [], logs = [], logfiles = {}, selectedWorkflow = null, logsExpanded = true, loading = false;
+        let currentUser = null, workflows = [], agents = [], scripts = [], selectedAgents = [], logs = [], logfiles = {}, selectedWorkflow = null, logsExpanded = true, loading = false;
 
-        document.addEventListener('DOMContentLoaded', () => { loadUserInfo(); loadData(); setInterval(loadData, 30000); });
+        document.addEventListener('DOMContentLoaded', () => { loadUserInfo(); loadScripts(); loadData(); setInterval(loadData, 30000); });
 
         async function loadUserInfo() {
             try {
@@ -379,6 +381,31 @@
                 document.getElementById('authMethod').textContent = 'Connection Failed';
                 addLog(`Authentication error: ${err.message}`, 'error');
             }
+        }
+
+        async function loadScripts() {
+            try {
+                const res = await fetch(`${API_BASE}/scripts`, { credentials: 'include' });
+                if (res.ok) {
+                    const data = await res.json();
+                    scripts = data.scripts || [];
+                    renderScriptDropdown();
+                    addLog(`Loaded ${scripts.length} scripts`, 'success');
+                }
+            } catch (err) {
+                addLog(`Failed to load scripts: ${err.message}`, 'error');
+                renderScriptDropdown();
+            }
+        }
+
+        function renderScriptDropdown() {
+            const select = document.getElementById('wfScriptId');
+            if (scripts.length === 0) {
+                select.innerHTML = '<option value="">No scripts registered</option>';
+                return;
+            }
+            select.innerHTML = '<option value="">-- Select a script --</option>' + 
+                scripts.map(s => `<option value="${escapeHtml(s.script_id)}" title="${escapeHtml(s.description || '')}">${escapeHtml(s.script_id)}${s.description ? ' - ' + escapeHtml(s.description.substring(0, 30)) : ''}</option>`).join('');
         }
 
         async function apiCall(endpoint, options = {}) {
@@ -443,13 +470,16 @@
         function selectWorkflow(id) { selectedWorkflow = id; renderWorkflows(); updateLogsPanel(); }
 
         async function createWorkflow() {
-            const scriptId = document.getElementById('wfScriptId').value.trim(), requestor = document.getElementById('wfRequestor').value.trim(), reason = document.getElementById('wfReason').value.trim();
-            if (!scriptId || !requestor || !reason) { addLog('Please fill in all workflow fields', 'error'); return; }
+            const scriptId = document.getElementById('wfScriptId').value;
+            const requestor = document.getElementById('wfRequestor').value.trim();
+            const reason = document.getElementById('wfReason').value.trim();
+            if (!scriptId) { addLog('Please select a script', 'error'); return; }
+            if (!requestor || !reason) { addLog('Please fill in all workflow fields', 'error'); return; }
             if (selectedAgents.length === 0) { addLog('Please select at least one target agent', 'error'); return; }
             try {
                 await apiCall('/workflows', { method: 'POST', body: JSON.stringify({ script_id: scriptId, targets: selectedAgents, requestor, reason, required_approval_levels: 1, ttl_minutes: 60 }) });
                 addLog('Workflow created successfully', 'success');
-                document.getElementById('wfScriptId').value = ''; document.getElementById('wfReason').value = '';
+                document.getElementById('wfScriptId').selectedIndex = 0; document.getElementById('wfReason').value = '';
                 selectedAgents = []; document.getElementById('selectedCount').textContent = '0'; loadData();
             } catch (err) { addLog(`Failed to create workflow: ${err.message}`, 'error'); }
         }
