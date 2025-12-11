@@ -29,18 +29,17 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scripts", tags=["scripts"])
 
-# SSL Configuration
-SSL_ENABLED = os.getenv("SSL_ENABLED", "false").lower() == "true"
-SSL_VERIFY = os.getenv("SSL_VERIFY", "true").lower() == "true"
-SSL_CA_CERTS = os.getenv("SSL_CA_CERTS", None)
+# SSL Configuration - ENABLED BY DEFAULT
+SSL_ENABLED = os.getenv("SSL_ENABLED", "true").lower() == "true"
+SSL_VERIFY = os.getenv("SSL_VERIFY", "false").lower() == "true"  # False for self-signed certs
+SSL_CA_CERTS = os.getenv("SSL_CA_CERTS", "./certs/certChain.pem")
 
 # Script storage configuration
 SCRIPTS_BASE_PATH = os.getenv("SCRIPTS_BASE_PATH", "/opt/orchestration/scripts")
 
+# Log SSL configuration at startup
+logger.info(f"[SSL] Scripts route - SSL_ENABLED: {SSL_ENABLED}, SSL_VERIFY: {SSL_VERIFY}")
 
-
-
-logger = logging.getLogger(__name__)
 
 def run_workflow_script(workflow_id: str, workflow: dict, execution_id: int):
     """
@@ -144,6 +143,15 @@ def validate_script_exists(script_path: str) -> bool:
         return False
 
 
+def get_ssl_verify_config():
+    """Get SSL verification config for httpx client"""
+    if not SSL_VERIFY:
+        return False
+    if SSL_CA_CERTS and os.path.exists(SSL_CA_CERTS):
+        return SSL_CA_CERTS
+    return False  # Fall back to no verification if CA certs not found
+
+
 async def send_execution_to_agent(
     agent_host: str,
     agent_port: int,
@@ -158,13 +166,15 @@ async def send_execution_to_agent(
     
     Returns execution result from agent
     """
-    protocol = "https" if agent_ssl else "http"
+    # Use HTTPS if agent has SSL enabled OR if global SSL is enabled
+    use_ssl = agent_ssl or SSL_ENABLED
+    protocol = "https" if use_ssl else "http"
     url = f"{protocol}://{agent_host}:{agent_port}/execute"
     
     # Configure SSL verification
-    verify_ssl = SSL_VERIFY
-    if SSL_VERIFY and SSL_CA_CERTS:
-        verify_ssl = SSL_CA_CERTS
+    verify_ssl = get_ssl_verify_config()
+    
+    logger.info(f"[SSL] Connecting to agent: {url} (verify={verify_ssl})")
     
     payload = {
         "script_path": script_path,
@@ -346,6 +356,7 @@ async def execute_script(
     logger.info(f"Script ID: {script_id}")
     logger.info(f"Targets: {request.target_agents}")
     logger.info(f"User: {user.get('token_name', 'unknown')}")
+    logger.info(f"SSL Enabled: {SSL_ENABLED}")
 
     # Get script from database
     script = db.get_script(script_id)
@@ -380,11 +391,14 @@ async def execute_script(
         if agent_status != 'online':
             logger.warning(f"Agent {agent_name} status: {agent_status}")
         
+        # Default to SSL_ENABLED if agent doesn't have ssl_enabled field
+        agent_ssl = agent.get('ssl_enabled', SSL_ENABLED)
+        
         agent_info.append({
             "name": agent_name,
             "host": agent['host'],
             "port": agent['port'],
-            "ssl_enabled": agent.get('ssl_enabled', False),
+            "ssl_enabled": agent_ssl,
             "status": agent_status
         })
     
